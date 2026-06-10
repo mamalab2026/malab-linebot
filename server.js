@@ -24,11 +24,15 @@ function verifySignature(req) {
 }
 
 function parseOrder(text) {
-  if (!text) return 0;
+  if (!text) return null;
   const normalized = text.trim().replace(/[＋]/g, '+').replace(/[Ｘｘ]/g, 'x');
-  const m = normalized.match(/^\+(\d+)(?:\s*[xX×]\s*(\d+))?/);
-  if (!m) return 0;
-  return parseInt(m[1], 10) * (m[2] ? parseInt(m[2], 10) : 1);
+  const m = normalized.match(/^(.+?)\s*\+(\d+)(?:\s*[xX×]\s*(\d+))?$/);
+  if (!m) return null;
+  const productName = m[1].trim();
+  if (!productName) return null;
+  const base = parseInt(m[2], 10);
+  const mult = m[3] ? parseInt(m[3], 10) : 1;
+  return { productName, qty: base * mult };
 }
 
 function replyMessage(replyToken, text) {
@@ -36,6 +40,22 @@ function replyMessage(replyToken, text) {
   const options = {
     hostname: 'api.line.me',
     path: '/v2/bot/message/reply',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
+    }
+  };
+  const req = https.request(options);
+  req.write(body);
+  req.end();
+}
+
+function pushMessage(groupId, text) {
+  const body = JSON.stringify({ to: groupId, messages: [{ type: 'text', text }] });
+  const options = {
+    hostname: 'api.line.me',
+    path: '/v2/bot/message/push',
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -95,6 +115,13 @@ function syncToSheets(payload) {
   req.end();
 }
 
+function buildList(productName, camp) {
+  const total = camp.orders.reduce((s, o) => s + o.qty, 0);
+  if (camp.orders.length === 0) return `「${productName}」目前還沒有人下單喔！`;
+  const list = camp.orders.map((o, i) => `${i + 1}. ${o.displayName} ×${o.qty}`).join('\n');
+  return `📋「${productName}」目前名單：\n${list}\n\n合計：${total} 件`;
+}
+
 app.post('/webhook', (req, res) => {
   if (!verifySignature(req)) return res.status(401).send('Invalid signature');
   res.sendStatus(200);
@@ -108,39 +135,83 @@ app.post('/webhook', (req, res) => {
     const groupId = event.source.groupId || event.source.roomId || null;
     const contextId = groupId || userId;
 
-    if (text.startsWith('#開團')) {
-      const name = text.replace('#開團', '').trim() || '本次團購';
+    if (!campaigns[contextId]) campaigns[contextId] = {};
+
+    if (text.startsWith('#群內+')) {
+      const productName = text.replace('#群內+', '').trim();
+      if (!productName) {
+        replyMessage(event.replyToken, '請輸入商品名稱，例如：#群內+ 小寶寶書');
+        return;
+      }
       const dateStr = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }).replace(/\//g, '-');
-      const sheetName = `${name}_${dateStr}`.replace(/[\\/*?[\]':]/g, '');
-      campaigns[contextId] = { campaignName: name, sheetName, orders: [], startTime: new Date().toISOString() };
-      syncToSheets({ action: 'init', sheetName, campaignName: name, startTime: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }) });
+      const sheetName = `${productName}_${dateStr}`.replace(/[\\/*?[\]':]/g, '');
+      campaigns[contextId][productName] = {
+        sheetName,
+        orders: [],
+        startTime: new Date().toISOString()
+      };
+      syncToSheets({ action: 'init', sheetName, campaignName: productName, startTime: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }) });
       replyMessage(event.replyToken,
-        `✅ 已開始統計「${name}」\n請大家回覆 +1 下單\n支援格式：+1 / +2 / +1x2 / +1 x3\n\n輸入「#名單」查看目前名單\n輸入「#結團」結束統計\n\n📊 訂單同步寫入 Google Sheets`
+        `✅ 已開始統計「${productName}」\n` +
+        `回覆「${productName}+1」下單\n` +
+        `支援格式：+1 / +2 / +1x2\n\n` +
+        `查看名單：#名單 ${productName}\n` +
+        `結束統計：#結團 ${productName}`
       );
       return;
     }
 
-    if (text === '#結團') {
-      const camp = campaigns[contextId];
-      if (!camp) { replyMessage(event.replyToken, '⚠️ 目前沒有進行中的團購'); return; }
+    if (text.startsWith('#結團')) {
+      const productName = text.replace('#結團', '').trim();
+      if (!productName) {
+        replyMessage(event.replyToken, '請輸入商品名稱，例如：#結團 小寶寶書');
+        return;
+      }
+      const camp = campaigns[contextId][productName];
+      if (!camp) {
+        replyMessage(event.replyToken, `⚠️ 找不到「${productName}」的團購，請確認名稱是否正確`);
+        return;
+      }
       const total = camp.orders.reduce((s, o) => s + o.qty, 0);
       syncToSheets({ action: 'close', sheetName: camp.sheetName, totalPeople: camp.orders.length, totalQty: total, endTime: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }) });
-      replyMessage(event.replyToken, `🎉「${camp.campaignName}」已結團！\n共 ${camp.orders.length} 人 × ${total} 件\n\n📊 名單已同步至 Google Sheets ✅`);
+      const listText = buildList(productName, camp);
+      replyMessage(event.replyToken,
+        `🎉「${productName}」已結團！\n共 ${camp.orders.length} 人 × ${total} 件\n\n${listText}`
+      );
+      delete campaigns[contextId][productName];
       return;
     }
 
-    if (text === '#名單') {
-      const camp = campaigns[contextId];
-      if (!camp || camp.orders.length === 0) { replyMessage(event.replyToken, '目前還沒有人下單喔！'); return; }
-      const total = camp.orders.reduce((s, o) => s + o.qty, 0);
-      const list = camp.orders.map((o, i) => `${i + 1}. ${o.displayName} ×${o.qty}`).join('\n');
-      replyMessage(event.replyToken, `📋「${camp.campaignName}」目前名單：\n${list}\n\n合計：${total} 件`);
+    if (text.startsWith('#名單')) {
+      const productName = text.replace('#名單', '').trim();
+      if (!productName) {
+        const active = Object.keys(campaigns[contextId]);
+        if (active.length === 0) {
+          replyMessage(event.replyToken, '目前沒有進行中的團購');
+          return;
+        }
+        const summary = active.map(p => {
+          const c = campaigns[contextId][p];
+          const total = c.orders.reduce((s, o) => s + o.qty, 0);
+          return `・${p}：${c.orders.length} 人 / ${total} 件`;
+        }).join('\n');
+        replyMessage(event.replyToken, `📋 目前進行中的團購：\n${summary}`);
+        return;
+      }
+      const camp = campaigns[contextId][productName];
+      if (!camp) {
+        replyMessage(event.replyToken, `⚠️ 找不到「${productName}」的團購`);
+        return;
+      }
+      replyMessage(event.replyToken, buildList(productName, camp));
       return;
     }
 
-    const qty = parseOrder(text);
-    if (qty <= 0) return;
-    const camp = campaigns[contextId];
+    const order = parseOrder(text);
+    if (!order) return;
+
+    const { productName, qty } = order;
+    const camp = campaigns[contextId][productName];
     if (!camp) return;
 
     getDisplayName(userId, groupId, (displayName) => {
@@ -148,11 +219,21 @@ app.post('/webhook', (req, res) => {
       const existing = camp.orders.find(o => o.userId === userId);
       const isUpdate = !!existing;
       if (isUpdate) {
-        existing.qty = qty; existing.time = now; existing.displayName = displayName;
+        existing.qty = qty;
+        existing.time = now;
+        existing.displayName = displayName;
       } else {
         camp.orders.push({ userId, displayName, qty, time: now });
       }
-      syncToSheets({ action: 'upsert', sheetName: camp.sheetName, userId, displayName, qty, isUpdate, time: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }) });
+      syncToSheets({
+        action: 'upsert',
+        sheetName: camp.sheetName,
+        userId, displayName, qty, isUpdate,
+        time: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })
+      });
+      if (groupId) {
+        pushMessage(groupId, buildList(productName, camp));
+      }
     });
   });
 });
@@ -160,22 +241,26 @@ app.post('/webhook', (req, res) => {
 app.get('/admin', (req, res) => {
   if (req.query.pw !== ADMIN_PASSWORD) return res.status(401).json({ error: '密碼錯誤' });
   const gid = req.query.group;
-  if (gid) return res.json(campaigns[gid] || { error: '找不到此群組' });
-  const summary = Object.entries(campaigns).map(([id, c]) => ({
-    groupId: id, campaignName: c.campaignName, sheetName: c.sheetName,
-    count: c.orders.length, total: c.orders.reduce((s, o) => s + o.qty, 0)
+  if (gid) return res.json(campaigns[gid] || {});
+  const summary = Object.entries(campaigns).map(([id, products]) => ({
+    groupId: id,
+    products: Object.entries(products).map(([name, c]) => ({
+      name, count: c.orders.length, total: c.orders.reduce((s, o) => s + o.qty, 0)
+    }))
   }));
   res.json(summary);
 });
 
 app.get('/csv', (req, res) => {
   if (req.query.pw !== ADMIN_PASSWORD) return res.status(401).send('密碼錯誤');
-  const camp = campaigns[req.query.group];
-  if (!camp) return res.status(404).send('找不到此群組');
+  const gid = req.query.group;
+  const product = req.query.product;
+  const camp = campaigns[gid] && campaigns[gid][product];
+  if (!camp) return res.status(404).send('找不到資料');
   const rows = [['編號','名稱','數量','下單時間'], ...camp.orders.map((o,i) => [i+1, o.displayName, o.qty, new Date(o.time).toLocaleString('zh-TW',{timeZone:'Asia/Taipei'})])];
   const csv = rows.map(r => r.join(',')).join('\n');
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', 'attachment; filename="orders.csv"');
+  res.setHeader('Content-Disposition', `attachment; filename="${product}.csv"`);
   res.send('\uFEFF' + csv);
 });
 
